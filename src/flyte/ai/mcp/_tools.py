@@ -30,6 +30,9 @@ MAX_LOG_LINES = 2000
 #: Overall budget for collecting log lines before returning what we have.
 LOG_COLLECT_TIMEOUT_S = 30.0
 
+#: How many condition-details requests `list_conditions` keeps in flight at once.
+CONDITION_DETAILS_CONCURRENCY = 8
+
 #: How many server-side entries the ``list_*`` tools scan when an allowlist is configured.
 #: The allowlist is applied client-side, so passing the caller's ``limit`` straight through would
 #: let the server truncate before filtering and hide allowed entries that sit past the first page.
@@ -156,6 +159,22 @@ def _pb_to_dict(message: Any) -> dict | None:
     from google.protobuf.json_format import MessageToDict
 
     return MessageToDict(message, preserving_proto_field_name=True)
+
+
+def _condition_dict(c: Any) -> dict:
+    """Serialize a `flyte.remote.Condition` whose details have been fetched."""
+    expected = c.expected_type
+    return {
+        "name": c.name,
+        "action_name": c.action_name,
+        "run_name": c.run_name,
+        "phase": c.phase,
+        "expected_type": expected.__name__ if expected is not None else None,
+        "prompt": c.prompt,
+        "prompt_type": c.prompt_type,
+        "description": c.description,
+        "timeout_s": _seconds(c.timeout),
+    }
 
 
 # ------------------------------
@@ -1132,27 +1151,46 @@ def build_tool_functions(env: FlyteMCPAppEnvironment) -> dict[str, Any]:
     ) -> list[dict]:
         """List the conditions of a run — the points where it is paused for external input.
 
-        `expected_type` is the payload type `signal_condition` will coerce to. A run stuck in
-        a paused phase usually has an unsignalled condition here.
+        Each entry carries what the condition is asking: `prompt` (render as markdown when
+        `prompt_type` is "markdown"), `description`, `timeout_s` (null when it waits forever)
+        and `expected_type`, the payload type `signal_condition` will coerce to. A run stuck
+        in a paused phase usually has an unsignalled condition here.
         """
-        from flyte.remote._condition import resolve_condition_expected_type
-
         with env._scoped(project, domain):
-            out: list[dict] = []
+            conditions: list[Any] = []
             async for c in cast(Any, flyte.remote.Condition.listall).aio(run_name=run_name, limit=limit):
-                expected = resolve_condition_expected_type(c.pb2)
-                out.append(
-                    {
-                        "name": c.name,
-                        "action_name": c.action_name,
-                        "run_name": c.run_name,
-                        "phase": c.phase,
-                        "expected_type": expected.__name__ if expected is not None else None,
-                    }
-                )
-                if len(out) >= limit:
+                conditions.append(c)
+                if len(conditions) >= limit:
                     break
-            return out
+
+            # The prompt and timeout are only on the action-details RPC, one call per condition.
+            # Bounded so a large `limit` does not open that many requests at once.
+            slots = asyncio.Semaphore(CONDITION_DETAILS_CONCURRENCY)
+
+            async def _with_details(c: Any) -> Any:
+                async with slots:
+                    return await c.fetch_details.aio()
+
+            detailed = await asyncio.gather(*(_with_details(c) for c in conditions))
+            return [_condition_dict(c) for c in detailed]
+
+    async def get_condition(
+        name: str,
+        run_name: str,
+        project: str | None = None,
+        domain: str | None = None,
+        ctx: MCPContext | None = None,
+    ) -> dict:
+        """Get one condition of a run by name: what it asks, its payload type and its timeout.
+
+        Same fields as a `list_conditions` entry. Use it before `signal_condition` to read the
+        prompt the signal is answering.
+        """
+        with env._scoped(project, domain):
+            condition = await cast(Any, flyte.remote.Condition.get).aio(name, run_name=run_name)
+            if condition is None:
+                raise ToolError(f"Condition '{name}' was not found in run '{run_name}'.")
+            return _condition_dict(await condition.fetch_details.aio())
 
     async def signal_condition(
         name: str,
@@ -1300,6 +1338,7 @@ def build_tool_functions(env: FlyteMCPAppEnvironment) -> dict[str, Any]:
         "create_secret": create_secret,
         "delete_secret": delete_secret,
         "list_conditions": list_conditions,
+        "get_condition": get_condition,
         "signal_condition": signal_condition,
         "whoami": whoami,
         "search_flyte_sdk_examples": search_flyte_sdk_examples,
